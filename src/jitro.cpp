@@ -177,9 +177,9 @@ void NetworkManager::manage() {
 			lastMessage = time(NULL); // any server message counts
 			if(startsWith(line, "PING"))
 				isock->send("PONG" + line.substr(4));
-
-			// pipe to all subprocesses
-			alertAllSproc(network, line); // TODO: repeatedly acquires lock...
+			else
+				// pipe to all subprocesses
+				alertAllSproc(network, line); // TODO: repeatedly acquires lock...
 		}
 
 		if(!didSomething)
