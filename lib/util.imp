@@ -1,0 +1,26 @@
+// vim: ft=cpp:
+
+#include <algorithm>
+#include <sstream>
+
+template<typename T> std::string util::toString(T val) {
+	std::stringstream ss;
+	ss << val;
+	return ss.str();
+}
+template<typename T> T util::fromString(std::string val) {
+	std::stringstream ss;
+	ss << val;
+	T res = 0;
+	ss >> res;
+	return res;
+}
+
+template<typename T> bool util::contains(std::vector<T> &vector, T key) {
+	return (find(vector.begin(), vector.end(), key) != vector.end());
+}
+
+template<typename K, typename V> bool util::contains(std::map<K, V> &map, K key) {
+	return (map.find(key) != map.end());
+}
+
