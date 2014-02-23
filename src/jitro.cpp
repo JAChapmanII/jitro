@@ -34,8 +34,21 @@ Config conf;
 
 vector<Subprocess *> sprocs;
 
+vector<string> getChannelsForNetwork(string network);
+vector<string> getChannelsForNetwork(string network) {
+	string netscope = "irc." + network + ".";
+
+	vector<string> channels = split(conf[netscope + "channels"]);
+	if(channels.empty()) {
+		cerr << "jitro: " + network + " has no defined channels" << endl;
+		throw 0;
+	}
+
+	return channels;
+}
+
 struct NetworkManager {
-	NetworkManager(string inetwork);
+	NetworkManager(string inetwork, vector<string> ichannels);
 	NetworkManager(NetworkManager &&rhs);
 	~NetworkManager();
 
@@ -52,19 +65,20 @@ struct NetworkManager {
 
 	private:
 		void manage();
+		void joinChannels();
 
 	private:
 		mutex _toSendMutex{};
 		vector<string> _toSend{};
+		vector<string> _channels{};
 };
 
 NetworkManager::~NetworkManager() {
 	clear();
 }
 
-NetworkManager::NetworkManager(string inetwork) {
-	network = inetwork;
-
+NetworkManager::NetworkManager(string inetwork, vector<string> ichannels)
+		: network(inetwork), _channels(ichannels) {
 	string netscope = "irc." + network + ".", server = conf[netscope + "server"];
 	if(server.empty()) {
 		cerr << "jitro: " + network + " has no defined server" << endl;
@@ -98,13 +112,7 @@ NetworkManager::NetworkManager(string inetwork) {
 		throw 0;
 	}
 
-	for(auto channel : channels) {
-		cout << "jitro: connecting to " << channel
-			<< " on " << network << endl;
-		if(isock->join(channel) != 0) {
-			cerr << "jitro: unable to connect to channel: " << channel << endl;
-		}
-	}
+	joinChannels();
 
 	mthread = move(thread(&NetworkManager::manage, this));
 }
@@ -156,6 +164,7 @@ void NetworkManager::manage() {
 				cerr << "jitro: unable to connect to server for " << network << endl;
 				cerr << "jitro: waiting and trying to reconnect" << endl;
 				sleep(10);
+				joinChannels();
 				// continue;
 			} else {
 				lastMessage = time(NULL);
@@ -184,6 +193,16 @@ void NetworkManager::manage() {
 
 		if(!didSomething)
 			usleep(1000);
+	}
+}
+
+void NetworkManager::joinChannels() {
+	for(auto channel : _channels) {
+		cout << "jitro: connecting to " << channel
+			<< " on " << network << endl;
+		if(isock->join(channel) != 0) {
+			cerr << "jitro: unable to connect to channel: " << channel << endl;
+		}
 	}
 }
 
@@ -226,7 +245,9 @@ int main(int argc, char **argv) {
 	vector<NetworkManager *> netmans;
 	for(auto network : networks) {
 		try {
-			netmans.push_back(new NetworkManager{ network });
+			netmans.push_back(new NetworkManager{
+					network, getChannelsForNetwork(network)
+				});
 		} catch(int) {
 			// woohoo empty catch
 		}
