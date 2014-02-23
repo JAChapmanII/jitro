@@ -88,13 +88,13 @@ int Subprocess::run() {
 
 	// if we're the child, execv the binary
 	if(_pid == 0) {
+		// copy pipe ends onto stdin, stdout
 		::dup2(left[0](), 0);
-		left[0].close();
-		left[1].close();
-
 		::dup2(right[1](), 1);
+
+		// close unneeded ends
+		left[1].close();
 		right[0].close();
-		right[1].close();
 
 		char *bstr = (char *)_binary.c_str();
 		char **argv = new char*[_args.size() + 2];
@@ -136,14 +136,20 @@ int Subprocess::statusCode() const {
 
 
 int Subprocess::kill() {
+	if(_status == SubprocessStatus::INVALID) {
+		cerr << "Subprocess::kill: attempted to kill invalid subprocess" << endl;
+		return -1;
+	}
 	if(_status == SubprocessStatus::AfterExec) {
 		_status = SubprocessStatus::BeforeExec;
+		close();
 		return 0;
 	}
 	if(_status != SubprocessStatus::Exec)
 		return -1;
 	int ret = ::kill(_pid, SIGKILL);
 	_status = SubprocessStatus::BeforeExec;
+	close();
 	return ret;
 }
 
@@ -153,6 +159,9 @@ ssize_t Subprocess::write(string str) {
 		_wbuf += str + "\n";
 
 	if(_wbuf.empty())
+		return 0;
+
+	if(status() != SubprocessStatus::Exec)
 		return 0;
 
 	ssize_t wamount = ::write(_pipe[1], _wbuf.c_str(), _wbuf.length());
@@ -177,6 +186,9 @@ BufReader &Subprocess::br() {
 }
 
 void Subprocess::flush() {
+	if(status() != SubprocessStatus::Exec)
+		return;
+
 	while(!_wbuf.empty())
 		write();
 	::syncfs(_pipe[1]);
@@ -185,3 +197,13 @@ void Subprocess::flush() {
 string Subprocess::binary() const {
 	return _binary;
 }
+
+void Subprocess::close() {
+	if(_pipe[0] >= 0)
+		::close(_pipe[0]);
+	_pipe[0] = -1;
+	if(_pipe[1] >= 0)
+		::close(_pipe[1]);
+	_pipe[1] = -1;
+}
+

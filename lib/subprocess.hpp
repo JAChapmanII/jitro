@@ -52,6 +52,9 @@ struct Subprocess {
 	std::string binary() const;
 
 	protected:
+		void close();
+
+	protected:
 		std::string _binary{};
 		std::vector<std::string> _args{};
 
