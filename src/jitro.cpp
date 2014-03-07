@@ -164,10 +164,11 @@ void NetworkManager::manage() {
 				cerr << "jitro: unable to connect to server for " << network << endl;
 				cerr << "jitro: waiting and trying to reconnect" << endl;
 				sleep(10);
-				joinChannels();
 				// continue;
 			} else {
 				lastMessage = time(NULL);
+				sleep(1);
+				joinChannels();
 			}
 		}
 
