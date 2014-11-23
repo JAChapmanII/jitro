@@ -90,7 +90,7 @@ int IRCSock::connect() {
 	send("NICK " + _nick);
 	usleep(10000);
 
-	send("USER " + _nick + " jac2.net jac2.net :" + _nick);
+	send("USER " + _nick + " 0 * :" + _nick);
 	usleep(10000);
 
 	// loop until we receive and error or the connected-go-ahead
