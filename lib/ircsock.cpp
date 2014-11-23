@@ -210,6 +210,7 @@ vector<string> IRCSock::channels() const {
 
 int IRCSock::quit() {
 	send("QUIT");
+	usleep(1000);
 	_channels.clear();
 	_br.clear();
 	return 0;
