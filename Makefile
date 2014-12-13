@@ -9,7 +9,7 @@ OBJS=
 OBJS+=${OBJ}/util.o ${OBJ}/config.o ${OBJ}/ircsock.o
 OBJS+=${OBJ}/bufreader.o ${OBJ}/subprocess.o
 
-CXXFLAGS=-std=c++0x -I${LIB} -D_BSD_SOURCE
+CXXFLAGS=-std=c++0x -I${LIB} -D_DEFAULT_SOURCE
 LDFLAGS=-lpthread
 
 # release/NA flags

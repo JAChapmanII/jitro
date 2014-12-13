@@ -8,6 +8,7 @@ using std::endl;
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <cassert>
 
 #include "util.hpp"
 using util::endsWith;
@@ -18,6 +19,7 @@ static const unsigned readSize = (1024 * 16);
 void BufReader::setup(int nFD, string nSplit) {
 	_fd = nFD;
 	_split = nSplit;
+	assert(("BufReader::setup: split is empty", !_split.empty()));
 	_eof = false;
 	setBlocking(false);
 }
