@@ -8,11 +8,6 @@ using std::string;
 using std::vector;
 #include <map>
 using std::map;
-#include <mutex>
-using std::mutex;
-using std::lock_guard;
-#include <thread>
-using std::thread;
 #include <memory>
 using std::move;
 
@@ -27,14 +22,14 @@ using util::contains;
 using util::split;
 using util::executable;
 using util::startsWith;
+using util::fromString;
 
 bool done = false;
 static string configFile = "jitro.conf";
 Config conf;
 
-vector<Subprocess *> sprocs;
-
 vector<string> getChannelsForNetwork(string network);
+
 vector<string> getChannelsForNetwork(string network) {
 	string netscope = "irc." + network + ".";
 
@@ -47,47 +42,55 @@ vector<string> getChannelsForNetwork(string network) {
 	return channels;
 }
 
-struct NetworkManager {
-	NetworkManager(string inetwork, vector<string> ichannels);
-	NetworkManager(NetworkManager &&rhs);
-	~NetworkManager();
+struct ConnectionManager {
+	ConnectionManager(string inetwork);
+	~ConnectionManager();
 
-	NetworkManager(const NetworkManager &rhs) = delete;
-	NetworkManager &operator=(const NetworkManager &rhs) = delete;
+	ConnectionManager(ConnectionManager &&rhs);
+	ConnectionManager(const ConnectionManager &rhs) = delete;
+	ConnectionManager &operator=(const ConnectionManager &rhs) = delete;
 
-	void clear();
-	void send(string msg);
+	void manage();
 
-	IRCSock *isock{nullptr};
-	time_t lastMessage{time(NULL)};
-	string network{};
-	thread mthread{};
+	void write(string line);
+	vector<string> read();
 
-	private:
-		void manage();
-		void joinChannels();
+	string name();
 
-	private:
-		mutex _toSendMutex{};
-		vector<string> _toSend{};
-		vector<string> _channels{};
+	protected:
+		IRCSock *_isock{nullptr};
+		vector<string> _out{};
+		vector<string> _in{};
+		string _network{};
 };
 
-NetworkManager::~NetworkManager() {
-	clear();
+ConnectionManager::~ConnectionManager() {
+	if(_isock) {
+		_isock->quit();
+		_isock->process();
+		delete _isock;
+	}
+}
+ConnectionManager::ConnectionManager(ConnectionManager &&rhs) :
+		_isock(rhs._isock), _out(rhs._out), _in(rhs._in), _network(rhs._network) {
+	rhs._isock = nullptr;
 }
 
-NetworkManager::NetworkManager(string inetwork, vector<string> ichannels)
-		: network(inetwork), _channels(ichannels) {
-	string netscope = "irc." + network + ".", server = conf[netscope + "server"];
+ConnectionManager::ConnectionManager(string inetwork) : _network(inetwork) {
+	string netscope = "irc." + _network + ".", server = conf[netscope + "server"];
 	if(server.empty()) {
-		cerr << "jitro: " + network + " has no defined server" << endl;
+		cerr << "jitro: " + _network + " has no defined server" << endl;
 		throw 0;
 	}
 
+	string sport = conf[netscope + "port"];
+	if(sport.empty()) sport = "6667";
+
+	int port = fromString<int>(sport);
+
 	vector<string> nicks = split(conf[netscope + "nicks"]);
 	if(nicks.empty()) {
-		cerr << "jitro: " + network + " has no defined nicks" << endl;
+		cerr << "jitro: " + _network + " has no defined nicks" << endl;
 		throw 0;
 	}
 
@@ -97,115 +100,133 @@ NetworkManager::NetworkManager(string inetwork, vector<string> ichannels)
 
 	vector<string> channels = split(conf[netscope + "channels"]);
 	if(channels.empty()) {
-		cerr << "jitro: " + network + " has no defined channels" << endl;
+		cerr << "jitro: " + _network + " has no defined channels" << endl;
 		throw 0;
 	}
 
-	cout << "jitro: connecting to " << network
-		<< " (" << server << ")" << " as " << nicks[0] << " "
+	cout << "jitro: connecting to " << _network
+		<< " (" << server << ":" << port << ")" << " as " << nicks[0] << " "
 		<< (passwords[nicks[0]].empty() ? "" : "(has password)") << endl;
 
-	isock = new IRCSock(server, 6667, nicks[0], passwords[nicks[0]]);
-	if(isock->connect() != 0) {
-		cerr << "jitro: unable to connect to server for " << network << endl;
-		clear();
-		throw 0;
-	}
-
-	joinChannels();
-
-	mthread = move(thread(&NetworkManager::manage, this));
-}
-NetworkManager::NetworkManager(NetworkManager &&rhs)
-		: isock(rhs.isock), lastMessage(rhs.lastMessage), network(rhs.network),
-		mthread(move(rhs.mthread)), _toSendMutex(), _toSend(move(rhs._toSend)) {
-}
-
-void NetworkManager::clear() {
-	if(isock) {
-		// TODO: we don't have to part everything before QUIT'ing
-		for(auto channel : isock->channels()) {
-			cout << "jitro: parting from " << channel << " on " << network << endl;
-			isock->part(channel);
-		}
-
-		isock->quit();
-
-		delete isock;
-		isock = nullptr;
-	}
-	lastMessage = 0;
-}
-void NetworkManager::send(string msg) {
-	lock_guard<mutex> lock(_toSendMutex);
-	_toSend.push_back(msg);
-}
-
-void alertAllSproc(string network, string msg);
-void handleNetwork(string network);
-
-void alertAllSproc(string network, string msg) {
-	static mutex alert_mutex;
-	lock_guard<mutex> lock(alert_mutex);
-
-	for(auto sproc : sprocs) {
-		sproc->write(network + " " + msg);
-		sproc->flush();
+	_isock = new IRCSock(server, port, nicks[0], passwords[nicks[0]]);
+	for(auto &chan : channels) {
+		cerr << "jitro: joining " << chan << " on " << _network << endl;
+		_isock->join(chan);
 	}
 }
 
-void NetworkManager::manage() {
-	while(!done) {
-		bool didSomething = 0;
-		if(time(NULL) + 1 - lastMessage > 300) {
-			cerr << "network, time, lastPing: " << network << ", " << time(NULL)
-				<< ", " << lastMessage << endl;
-			if(isock->reset() != 0) {
-				cerr << "jitro: unable to connect to server for " << network << endl;
-				cerr << "jitro: waiting and trying to reconnect" << endl;
-				sleep(10);
-				// continue;
-			} else {
-				lastMessage = time(NULL);
-				sleep(1);
-				joinChannels();
-			}
-		}
+string ConnectionManager::name() {
+	return _network;
+}
+void ConnectionManager::write(string msg) {
+	_in.push_back(msg);
+}
+vector<string> ConnectionManager::read() {
+	vector<string> out = _out;
+	_out.clear();
+	return out;
+}
 
-		{ // dispatch all waiting messages
-			lock_guard<mutex> lock(_toSendMutex);
-			for(auto msg : _toSend) {
-				cerr << "jitro: sent \"" << msg << "\" to " << network << endl;
-				isock->send(msg);
-			}
-			_toSend.clear();
-		}
+void ConnectionManager::manage() {
+	_isock->process();
 
-		// copy from IRC socket to subprocess stdin
-		for(string line = isock->read(); !line.empty(); line = isock->read()) {
-			didSomething = true;
-			lastMessage = time(NULL); // any server message counts
-			if(startsWith(line, "PING"))
-				isock->send("PONG" + line.substr(4));
-			else
-				// pipe to all subprocesses
-				alertAllSproc(network, line); // TODO: repeatedly acquires lock...
-		}
+	// dispatch all waiting messages
+	for(auto msg : _in) {
+		cerr << "jitro: sent \"" << msg << "\" to " << _network << endl;
+		_isock->send(msg);
+	}
+	_in.clear();
 
-		if(!didSomething)
-			usleep(1000);
+	vector<string> out = _isock->read();
+	_out.reserve(_out.size() + out.size());
+	for(auto &line : out) {
+		// don't pass PINGs out
+		if(startsWith(line, "PING"))
+			continue;
+		_out.push_back(line);
 	}
 }
 
-void NetworkManager::joinChannels() {
-	for(auto channel : _channels) {
-		cout << "jitro: connecting to " << channel
-			<< " on " << network << endl;
-		if(isock->join(channel) != 0) {
-			cerr << "jitro: unable to connect to channel: " << channel << endl;
+
+
+struct BinaryManager {
+	BinaryManager(string binary);
+
+	BinaryManager(BinaryManager &&rhs);
+	BinaryManager(const BinaryManager &rhs) = delete;
+	BinaryManager &operator=(const BinaryManager &rhs) = delete;
+
+	void manage();
+
+	void write(string line);
+	vector<string> read();
+
+	string name();
+
+	protected:
+		Subprocess *_sproc{nullptr};
+		bool _failed{false};
+		vector<string> _out{};
+		vector<string> _in{};
+};
+
+BinaryManager::BinaryManager(string binary) : _sproc(new Subprocess(binary)) { }
+BinaryManager::BinaryManager(BinaryManager &&rhs) : _sproc(rhs._sproc),
+		_failed(rhs._failed), _out(rhs._out), _in(rhs._in) {
+	rhs._sproc = nullptr;
+}
+
+void BinaryManager::manage() {
+	if(_failed)
+		return;
+
+	if(_sproc->status() == SubprocessStatus::AfterExec) {
+		cout << "jitro: subproccess \"" << _sproc->binary()
+			<< "\" returned: " << _sproc->statusCode() << endl;
+		_sproc->kill();
+	}
+
+	if(_sproc->status() != SubprocessStatus::Exec) {
+		cout << "jitro: creating subprocess \"" << _sproc->binary()
+			<< "\"" << endl;
+		if(_sproc->run() != 0) {
+			cerr << "jitro: unable to run subprocess!?" << endl;
+			_failed = true;
 		}
+		return;
+	}
+
+	for(auto &l : _in) {
+		_sproc->write(l);
+		_sproc->flush();
+	}
+	_in.clear();
+
+	for(string line = _sproc->read(); !line.empty(); line = _sproc->read()) {
+		_out.push_back(line);
+	}
+
+	// if the subprocess has closed it's stdout, close it down
+	if(_sproc->br().eof()) {
+		cout << "jitro: subproc \"" << _sproc->binary()
+			<< "\" has returned EOF" << endl;
+		_sproc->kill();
 	}
 }
+
+vector<string> BinaryManager::read() {
+	vector<string> out = _out;
+	_out.clear();
+	return out;
+}
+void BinaryManager::write(string line) {
+	_in.push_back(line);
+}
+
+string BinaryManager::name() {
+	return _sproc->binary();
+}
+
 
 int main(int argc, char **argv) {
 	vector<string> args;
@@ -243,61 +264,52 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	vector<NetworkManager *> netmans;
-	for(auto network : networks) {
-		try {
-			netmans.push_back(new NetworkManager{
-					network, getChannelsForNetwork(network)
-				});
-		} catch(int) {
-			// woohoo empty catch
-		}
-	}
-
+	vector<BinaryManager> bins;
 	for(auto binary : binaries)
-		sprocs.push_back(new Subprocess(binary));
+		bins.emplace_back(binary);
+
+	vector<ConnectionManager> conns;
+	for(auto network : networks)
+		conns.emplace_back(network);
+
+	int ms = 1000;
 
 	// keep main thread alive
 	while(!done) {
-		bool didSomething = false;
-		for(auto sproc : sprocs) {
-			if(sproc->status() == SubprocessStatus::AfterExec) {
-				cout << "jitro: subproccess \"" << sproc->binary()
-					<< "\" returned: " << sproc->statusCode() << endl;
-				sproc->kill();
-			}
-			if(sproc->status() != SubprocessStatus::Exec) {
-				cout << "jitro: creating subprocess \"" << sproc->binary()
-					<< "\"" << endl;
-				if(sproc->run() != 0) {
-					cerr << "jitro: unable to run subprocess!?" << endl;
-					usleep(10000);
-					continue;
-				}
-				didSomething = true;
-				usleep(10000);
-			}
+		for(auto &bin : bins) {
+			bin.manage();
 
 			// copy from subprocesses stdout to the IRC socket
-			for(string line = sproc->read(); !line.empty(); line = sproc->read()) {
-				cerr << "jitro: read \"" << line << "\" from " << sproc->binary() << endl;
+			vector<string> lines = bin.read();
+			for(auto &line : lines) {
+				cerr << "jitro: read \"" << line << "\" from " << bin.name() << endl;
 				string destination = line.substr(0, line.find(" ")),
-						msg = line.substr(line.find(" ") + 1);
-				for(auto netman : netmans)
-					if(destination == "broadcast" || netman->network == destination)
-						netman->send(msg);
-			}
+					msg = line.substr(line.find(" ") + 1);
 
-			// if the subprocess has closed it's stdout, close it down
-			if(sproc->br().eof()) {
-				cout << "jitro: subproc \"" << sproc->binary()
-					<< "\" has returned EOF" << endl;
-				sproc->kill();
+				bool broadcast = destination == "broadcast";
+				if(startsWith(msg, "QUIT")) {
+					cerr << "jitro: read QUIT message" << endl;
+					done = true;
+				}
+
+				for(auto &conn : conns)
+					if(broadcast || conn.name() == destination)
+						conn.write(msg);
 			}
 		}
 
-		if(!didSomething)
-			usleep(1000);
+		for(auto &conn : conns) {
+			conn.manage();
+
+			// copy from irc to binaries
+			vector<string> lines = conn.read();
+			for(auto &line : lines) {
+				for(auto &bin : bins)
+					bin.write(conn.name() + " " + line);
+			}
+		}
+
+		usleep(10 * ms);
 	}
 
 	return 0;

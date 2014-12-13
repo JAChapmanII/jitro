@@ -5,6 +5,7 @@ using std::vector;
 
 #include <algorithm>
 using std::find;
+using std::min;
 #include <iostream>
 using std::cerr;
 using std::endl;
@@ -28,6 +29,7 @@ using util::startsWith;
 using util::toString;
 using util::formatTime;
 using util::trim;
+using util::split;
 
 static string logName = "ircsock.log";
 static ofstream logFile;
@@ -62,9 +64,182 @@ IRCSock::IRCSock(string host, int port, string nick, string password)
 
 // TODO: handle disconnecting
 IRCSock::~IRCSock() {
+	_quit();
+}
+
+string extractNick(string from);
+string extractNick(string from) {
+	if(from.find("!") == string::npos)
+		return from;
+	return from.substr(0, from.find("!"));
+}
+
+void IRCSock::_quit() {
+	if(_socket < 0 || _mstatus == Status::Disconnected)
+		return;
+	send("QUIT :goodbye"); // TODO
+	_trySend();
+
+	_connectionTries = 0;
+	_lastConnectionTry = 0;
+
+	_mstatus = Status::Disconnected;
+	_nstatus = NickStatus::NeedsSent;
+	_cstatus.clear();
+
+	_hasMOTD = false;
+
+	_br.clear();
+
+	usleep(1000);
+	if(_socket >= 0)
+		close(_socket);
+}
+
+bool IRCSock::process() {
+	switch(_mstatus) {
+		case Status::Connected:
+			break;
+		case Status::Disconnected: {
+			time_t now = time(NULL);
+			if(_connectionTries > _maxConnectionTries) {
+				_mstatus = Status::Failed;
+				return false;
+			}
+			// make sure we've waited long enough before retrying
+			int delay = min(1 << _connectionTries, _maxConnectionDelay);
+			if((now - _lastConnectionTry) < delay)
+				return false;
+
+			// attempt to connect
+			this->connect();
+			return true;
+		}
+		case Status::Failed:
+		case Status::INVALID:
+		default:
+			return false;
+	}
+
+	time_t now = time(NULL);
+	// if we've pinged out
+	if(now - _lastMessage > _pingTimeout) {
+		_quit();
+		return true;
+	}
+
+	bool didSomething = !_commandQueue.empty();
+	vector<Command> ncomms{};
+	for(int i = 0; i < _commandQueue.size(); ++i) {
+		Command &comm = _commandQueue[i];
+
+		switch(comm._type) {
+			case CommandType::Nick:
+				send("NICK " + comm._args[0]);
+				//usleep(10000);
+				_nstatus = NickStatus::Sent;
+				break;
+			case CommandType::User:
+				send("USER " + comm._args[0] + " 0 * :" + comm._args[0]);
+				//usleep(10000);
+				break;
+			case CommandType::Identify:
+				if(!_password.empty()) {
+					send("PRIVMSG NickServ :identify " + comm._args[0]);
+					//usleep(10000);
+					_nstatus = NickStatus::Verified;
+				} else  {
+					_nstatus = NickStatus::NoAuth;
+				}
+				break;
+			case CommandType::Join:
+				if(_hasMOTD) {
+					send("JOIN " + comm._args[0]);
+					//usleep(100000);
+				} else
+					ncomms.push_back(comm);
+				break;
+			case CommandType::Part:
+				send("PART " + comm._args[0]);
+				_cstatus[comm._args[0]] = ChannelStatus::Parted;
+				break;
+			case CommandType::Msg:
+				// TODO: join chan if not in chan?
+				send("PRIVMSG " + comm._args[0] + " :" + comm._args[1]);
+				break;
+			case CommandType::Quit:
+				_quit();
+				return true;
+			case CommandType::INVALID:
+			default:
+				break; // TODO
+		}
+	}
+	_commandQueue = ncomms;
+
+	// try sending anything we may be waiting to send
+	didSomething |= _trySend() > 0;
+
+	didSomething |= _canRead();
+	while(_canRead()) {
+		string line = _read();
+		if(line.empty())
+			continue;
+
+		vector<string> fields = split(line);
+		if(fields.size() < 2)
+			continue;
+		string from = fields[0], command = fields[1];
+
+		// if we see nick in use, abort
+		if(command == "433") {
+			_nstatus = NickStatus::Failed;
+			// TODO: switch to alternate nicks
+			cerr << "IRCSock::connect: nick in use!" << endl;
+			throw 433;
+		}
+
+		// if we recieve the nick invalid message, abort
+		if(command == "432") {
+			_nstatus = NickStatus::Failed;
+			// TODO: same as above
+			cerr << "IRCSock::connect: nick contains illegal charaters" << endl;
+			throw 432;
+		}
+
+		// if we see the end of motd code, we're in and may need to auth
+		if(command == "376") {
+			_commandQueue.push_back(Command(CommandType::Identify, _password));
+			_hasMOTD = true;
+		}
+
+		// TODO: names
+		// if(contains(line, " 332 ") || 
+
+		// somebody joined a channel
+		if(command == "JOIN") {
+			// we joined a channel
+			if(extractNick(from) == _nick) {
+				_cstatus[fields[2]] = ChannelStatus::Joined;
+			}
+		}
+
+		// respond to PINGs
+		if(startsWith(line, "PING"))
+			send("PONG" + line.substr(4));
+	}
+
+	// try sending anything we may be waiting to send
+	didSomething |= _trySend() > 0;
+
+	return didSomething;
 }
 
 int IRCSock::connect() {
+	_connectionTries++;
+	_lastConnectionTry = time(NULL);
+	cerr << "IRCSock::connect: attempting to connect to " << _host << endl;
+
 	// attempt to create socket
 	_socket = socket(AF_INET, SOCK_STREAM, 0);
 	if(_socket == -1) {
@@ -87,67 +262,32 @@ int IRCSock::connect() {
 	// setup our buffered reader object
 	_br.setup(_socket, "\r\n");
 
-	send("NICK " + _nick);
-	usleep(10000);
+	_mstatus = Status::Connected;
+	_commandQueue.push_back(Command(CommandType::Nick, _nick));
+	_commandQueue.push_back(Command(CommandType::User, _nick));
+	for(auto &chan : _channels)
+		_commandQueue.push_back(Command(CommandType::Join, chan));
 
-	send("USER " + _nick + " 0 * :" + _nick);
-	usleep(10000);
+	time_t now = time(NULL);
+	_lastMessage = now;
 
-	// loop until we receive and error or the connected-go-ahead
-	int done = 0;
-	while(!done) {
-		string str = read();
-		// if we didn't recieve a string, wait a bit
-		if(str.empty()) {
-			usleep(1000);
-			continue;
-		}
-
-		// if we see nick in use, abort
-		if(contains(str, " 433 ")) {
-			// TODO: switch to alternate nicks
-			cerr << "IRCSock::connect: nick in use!" << endl;
-			return 433;
-		}
-
-		// if we recieve the nick invalid message, abort
-		if(contains(str, " 432 ")) {
-			// TODO: same as above
-			cerr << "IRCSock::connect: nick contains illegal charaters" << endl;
-			return 432;
-		}
-
-		// if we see the end of motd code, we're in
-		if(contains(str, " 376 ")) {
-			if(!_password.empty()) {
-				send("PRIVMSG NickServ :identify " + _password);
-				usleep(10000);
-			}
-			return 0;
-		}
-
-		// respond to PINGs
-		if(startsWith(str, "PING"))
-			pong(str);
-	}
-
-	// error out (we shouldn't ever get here)
-	cerr << "IRCSock::connect: past connect done loop" << endl;
-	return -1;
+	return 0;
 }
 
-bool IRCSock::canRead() {
+bool IRCSock::_canRead() {
 	return _br.canRead();
 }
-string IRCSock::read() {
+string IRCSock::_read() {
 	string l = _br.read();
+	if(!l.empty()) {
+		_lastMessage = time(NULL);
+		_out.push_back(l);
+	}
 	log(_host, l);
 	return l;
 }
 
-ssize_t IRCSock::send(string str) {
-	if(!str.empty())
-		_wbuf += str + "\r\n";
+ssize_t IRCSock::_trySend() {
 	if(_wbuf.empty())
 		return 0;
 
@@ -165,59 +305,42 @@ ssize_t IRCSock::send(string str) {
 	return wamount;
 }
 
-ssize_t IRCSock::pmsg(string target, string msg) {
-	return send("PRIVMSG " + target + " :" + msg);
+
+void IRCSock::send(string str) {
+	if(!str.empty())
+		_wbuf += str + "\r\n";
+}
+void IRCSock::pmsg(string target, string msg) {
+	_commandQueue.push_back(Command(CommandType::Msg, target, msg));
 }
 
-int IRCSock::join(string chan) {
-	if(contains(_channels, chan))
-		return 0;
-
-	send("JOIN " + chan);
-	usleep(100000);
-
-	int done = 0;
-	while(!done) {
-		string str = read();
-		// if we didn't recieve a string, wait a bit
-		if(str.empty()) {
-			usleep(1000);
-			continue;
-		}
-
-		if(contains(str, " 332 ") || contains(str, " JOIN ")) {
-			_channels.push_back(chan);
-			return 0;
-		}
-
-		// respond to PINGs
-		if(startsWith(str, "PING"))
-			pong(str);
+void IRCSock::join(string chan) {
+	if(_cstatus.find(chan) == _cstatus.end()
+			|| _cstatus[chan] == ChannelStatus::Parted
+			|| _cstatus[chan] == ChannelStatus::Failed) {
+		_commandQueue.push_back(Command(CommandType::Join, chan));
+		_channels.push_back(chan);
 	}
-
-	return -1;
 }
 void IRCSock::part(string chan) {
-	if(!contains(_channels, chan))
+	if(_cstatus.find(chan) == _cstatus.end()
+			|| _cstatus[chan] != ChannelStatus::Joined)
 		return;
-	send("PART " + chan);
-	_channels.erase(find(_channels.begin(), _channels.end(), chan));
+	_commandQueue.push_back(Command(CommandType::Part, chan));
+
+	auto it = find(_channels.begin(), _channels.end(), chan);
+	if(it != _channels.end())
+		_channels.erase(it);
 }
 
-vector<string> IRCSock::channels() const {
-	return _channels;
+void IRCSock::quit() {
+	_commandQueue.push_back(Command(CommandType::Quit, "goodbype"));
 }
 
-int IRCSock::quit() {
-	send("QUIT");
-	usleep(1000);
-	_channels.clear();
-	_br.clear();
-	return 0;
-}
-
-void IRCSock::pong(string ping) {
-	send("PONG" + ping.substr(4));
+vector<string> IRCSock::read() {
+	vector<string> out = _out;
+	_out.clear();
+	return out;
 }
 
 AddressInfo IRCSock::lookupDomain() {
@@ -248,14 +371,5 @@ AddressInfo IRCSock::lookupDomain() {
 
 	// TODO: need {} wrap?
 	return result;
-}
-
-int IRCSock::reset() {
-	cerr << "IRCSock::reset: (host, port, domain, socket, nick): " << _host
-		<< ", " << _port << ", " << _domain << ", " << _socket << ", " << _nick
-		<< endl;
-	close(_socket);
-	// TODO: disconnect
-	return connect();
 }
 
