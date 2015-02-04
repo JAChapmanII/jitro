@@ -1,0 +1,11 @@
+#!/bin/bash
+
+echo "djuno: started" >&2
+while read -r line; do
+	echo "djuno: $line" >&2
+	if [[ -n $(echo "$line" | grep "djuno: quit") ]]; then
+		echo "broadcast QUIT :the quit message"
+	fi
+done
+echo "djuno: exiting" >&2
+
